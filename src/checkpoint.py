@@ -14,6 +14,9 @@ def save_checkpoint(category, keyword, total_records):
         "total_records": total_records
     }
 
+    print(f"Saving checkpoint to: {CHECKPOINT_FILE}")
+    print(checkpoint)
+
     with open(CHECKPOINT_FILE, "w") as f:
         json.dump(checkpoint, f, indent=4)
 
@@ -22,8 +25,16 @@ def load_checkpoint():
     if not os.path.exists(CHECKPOINT_FILE):
         return None
 
-    with open(CHECKPOINT_FILE, "r") as f:
-        return json.load(f)
+    # File exists but is empty
+    if os.path.getsize(CHECKPOINT_FILE) == 0:
+        return None
+
+    try:
+        with open(CHECKPOINT_FILE, "r") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        print("Checkpoint file is corrupted. Starting fresh.")
+        return None
 
 
 def clear_checkpoint():

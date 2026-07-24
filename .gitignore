@@ -9,3 +9,5 @@ __pycache__/
 .vscode/
 
 models/*.pkl
+__pycache__/
+*.pyc
