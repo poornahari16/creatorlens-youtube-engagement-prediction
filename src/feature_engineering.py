@@ -62,13 +62,14 @@ def prepare_data(df):
             )
 
     if "published_at" in df.columns:
-        df["published_at"] = pd.to_datetime(
-            df["published_at"],
-            errors="coerce",
-            utc=True
+        df["published_at"] = df["published_at"].apply(
+            lambda x: pd.to_datetime(
+                x,
+                errors="coerce",
+                utc=True
+            )
         )
-
-    return df
+        return df
 
 
 # ============================================================

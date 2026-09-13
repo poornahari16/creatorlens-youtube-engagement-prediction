@@ -11,3 +11,5 @@ __pycache__/
 models/*.pkl
 __pycache__/
 *.pyc
+
+.streamlit/secrets.toml

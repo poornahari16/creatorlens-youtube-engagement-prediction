@@ -1,29 +1,71 @@
 import os
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 
-FEATURE_DATA_PATH = "data/features/youtube_features.csv"
+# ============================================================
+# PATHS
+# ============================================================
+
+RAW_DATA_PATH = (
+    "data/processed/youtube_dataset_processed.csv"
+)
+
+FEATURE_DATA_PATH = (
+    "data/features/youtube_model_features.csv"
+)
+
 TARGET_DATA_DIR = "data/features"
+
 TARGET_DATA_PATH = os.path.join(
     TARGET_DATA_DIR,
     "youtube_target_dataset.csv"
 )
 
 
-def load_data(path=FEATURE_DATA_PATH):
-    df = pd.read_csv(path)
+# Minimum number of earlier videos required for a
+# reliable group baseline.
+MIN_GROUP_SIZE = 10
+
+# Minimum number of earlier videos from the same channel.
+MIN_CHANNEL_HISTORY = 3
+
+
+# ============================================================
+# LOAD DATA
+# ============================================================
+
+def load_data():
+
+    raw_df = pd.read_csv(
+        RAW_DATA_PATH
+    )
+
+    feature_df = pd.read_csv(
+        FEATURE_DATA_PATH
+    )
 
     print("=" * 70)
-    print("FEATURE DATA LOADED")
+    print("DATA LOADED")
     print("=" * 70)
-    print(f"Rows    : {len(df):,}")
-    print(f"Columns : {df.shape[1]:,}")
 
-    return df
+    print(
+        f"Processed rows : {len(raw_df):,}"
+    )
+
+    print(
+        f"Feature rows   : {len(feature_df):,}"
+    )
+
+    return raw_df, feature_df
 
 
-def prepare_data(df):
+# ============================================================
+# PREPARE RAW DATA
+# ============================================================
+
+def prepare_raw_data(df):
+
     df = df.copy()
 
     numeric_columns = [
@@ -34,21 +76,34 @@ def prepare_data(df):
     ]
 
     for column in numeric_columns:
+
         if column in df.columns:
+
             df[column] = pd.to_numeric(
                 df[column],
                 errors="coerce"
             )
 
+    # Convert publication time to datetime.
+    # Missing/invalid values remain NaT.
+    df["published_at"] = df["published_at"].apply(
+        lambda x: pd.to_datetime(
+            x,
+            errors="coerce",
+            utc=True
+        )
+    )
+
     return df
 
 
-def create_channel_size_group(df):
-    """
-    Group channels by their current subscriber count.
+# ============================================================
+# CREATE CHANNEL SIZE GROUP
+# ============================================================
 
-    These groups are used only as a broad comparison context.
-    """
+def create_channel_size_group(df):
+
+    df = df.copy()
 
     bins = [
         -1,
@@ -76,127 +131,230 @@ def create_channel_size_group(df):
     return df
 
 
+# ============================================================
+# CREATE TOPIC GROUP
+# ============================================================
+
 def create_topic_group(df):
-    """
-    Use the existing search category and keyword information
-    as a broad topic/context grouping.
-    """
+
+    df = df.copy()
+
+    df["search_category"] = (
+        df["search_category"]
+        .fillna("Unknown")
+        .astype(str)
+    )
+
+    df["search_keyword"] = (
+        df["search_keyword"]
+        .fillna("Unknown")
+        .astype(str)
+    )
 
     df["topic_group"] = (
-        df["search_category"].fillna("Unknown").astype(str)
+        df["search_category"]
         + " | "
-        + df["search_keyword"].fillna("Unknown").astype(str)
+        + df["search_keyword"]
     )
 
     return df
 
+
+# ============================================================
+# TIME-AWARE BASELINE
+# ============================================================
+
+def calculate_prior_baseline(
+    df,
+    group_columns,
+    minimum_history,
+    statistic="median"
+):
+    """
+    Calculate the baseline for each video using ONLY videos
+    published before that video.
+
+    The current video's own views are never included.
+
+    Videos without a valid published_at timestamp cannot
+    receive a time-aware baseline.
+    """
+
+    baseline = pd.Series(
+        np.nan,
+        index=df.index,
+        dtype=float
+    )
+
+    # Only videos with valid publication time and view count
+    # can be used to create historical baselines.
+    dated_df = df[
+        df["published_at"].notna()
+        & df["view_count"].notna()
+        & (df["view_count"] >= 0)
+    ].copy()
+
+    if dated_df.empty:
+        return baseline
+
+    # Sort chronologically.
+    dated_df = dated_df.sort_values(
+        ["published_at", "video_id"]
+    )
+
+    grouped = dated_df.groupby(
+        group_columns,
+        observed=True,
+        sort=False
+    )
+
+    for _, group in grouped:
+
+        values = group["view_count"].to_numpy(
+            dtype=float
+        )
+
+        indices = group.index.to_list()
+
+        dates = group["published_at"].to_numpy()
+
+        # Calculate each video's baseline independently.
+        for position, index in enumerate(indices):
+
+            current_date = dates[position]
+
+            # IMPORTANT:
+            # Only strictly earlier videos are allowed.
+            prior_values = values[
+                dates < current_date
+            ]
+
+            prior_values = prior_values[
+                ~np.isnan(prior_values)
+            ]
+
+            if len(prior_values) >= minimum_history:
+
+                if statistic == "mean":
+
+                    baseline.loc[index] = (
+                        np.mean(prior_values)
+                    )
+
+                else:
+
+                    baseline.loc[index] = (
+                        np.median(prior_values)
+                    )
+
+    return baseline
+
+
+# ============================================================
+# CHANNEL BASELINE
+# ============================================================
 
 def calculate_channel_baseline(df):
-    """
-    Calculate leave-one-out channel median views.
 
-    A video's own views are excluded from its channel baseline.
+    df = df.copy()
 
-    This baseline is only considered reliable when a channel
-    has enough historical videos.
-    """
-
-    channel_stats = (
-        df.groupby("channel_id")["view_count"]
-        .agg(
-            channel_video_count="count",
-            channel_view_sum="sum"
-        )
-    )
-
-    df = df.join(
-        channel_stats,
-        on="channel_id"
-    )
-
-    df["channel_baseline_views"] = np.nan
-
-    enough_history = df["channel_video_count"] >= 3
-
-    df.loc[enough_history, "channel_baseline_views"] = (
-        (
-            df.loc[enough_history, "channel_view_sum"]
-            - df.loc[enough_history, "view_count"]
-        )
-        /
-        (
-            df.loc[enough_history, "channel_video_count"]
-            - 1
+    df["channel_baseline_views"] = (
+        calculate_prior_baseline(
+            df=df,
+            group_columns=["channel_id"],
+            minimum_history=MIN_CHANNEL_HISTORY,
+            statistic="mean"
         )
     )
 
     return df
 
+
+# ============================================================
+# TOPIC + CHANNEL SIZE BASELINE
+# ============================================================
 
 def calculate_topic_baseline(df):
-    """
-    Calculate topic-level median views.
 
-    This provides a fallback when channel history is insufficient.
-    """
+    df = df.copy()
 
-    topic_baseline = (
-        df.groupby(
-            ["topic_group", "channel_size_group"],
-            observed=True
-        )["view_count"]
-        .transform("median")
+    df["topic_size_baseline_views"] = (
+        calculate_prior_baseline(
+            df=df,
+            group_columns=[
+                "topic_group",
+                "channel_size_group"
+            ],
+            minimum_history=MIN_GROUP_SIZE,
+            statistic="median"
+        )
     )
-
-    df["topic_size_baseline_views"] = topic_baseline
 
     return df
 
+
+# ============================================================
+# CATEGORY + CHANNEL SIZE BASELINE
+# ============================================================
 
 def calculate_category_baseline(df):
-    """
-    Calculate a broader category + channel-size baseline.
-    """
 
-    category_baseline = (
-        df.groupby(
-            ["search_category", "channel_size_group"],
-            observed=True
-        )["view_count"]
-        .transform("median")
+    df = df.copy()
+
+    df["category_size_baseline_views"] = (
+        calculate_prior_baseline(
+            df=df,
+            group_columns=[
+                "search_category",
+                "channel_size_group"
+            ],
+            minimum_history=MIN_GROUP_SIZE,
+            statistic="median"
+        )
     )
-
-    df["category_size_baseline_views"] = category_baseline
 
     return df
 
 
-def select_best_baseline(df):
-    """
-    Select the strongest available baseline.
+# ============================================================
+# CHANNEL SIZE BASELINE
+# ============================================================
 
-    Priority:
-    1. Channel baseline when enough channel history exists
-    2. Topic + channel-size baseline
-    3. Category + channel-size baseline
-    """
+def calculate_size_baseline(df):
+
+    df = df.copy()
+
+    df["size_baseline_views"] = (
+        calculate_prior_baseline(
+            df=df,
+            group_columns=["channel_size_group"],
+            minimum_history=MIN_GROUP_SIZE,
+            statistic="median"
+        )
+    )
+
+    return df
+
+
+# ============================================================
+# SELECT BEST BASELINE
+# ============================================================
+
+def select_best_baseline(df):
+
+    df = df.copy()
 
     df["baseline_type"] = "Unavailable"
+
     df["baseline_views"] = np.nan
+
+    # --------------------------------------------------------
+    # 1. CHANNEL
+    # --------------------------------------------------------
 
     channel_available = (
         df["channel_baseline_views"].notna()
         & (df["channel_baseline_views"] > 0)
-    )
-
-    topic_available = (
-        df["topic_size_baseline_views"].notna()
-        & (df["topic_size_baseline_views"] > 0)
-    )
-
-    category_available = (
-        df["category_size_baseline_views"].notna()
-        & (df["category_size_baseline_views"] > 0)
     )
 
     df.loc[
@@ -211,6 +369,15 @@ def select_best_baseline(df):
         channel_available,
         "baseline_type"
     ] = "Channel"
+
+    # --------------------------------------------------------
+    # 2. TOPIC + CHANNEL SIZE
+    # --------------------------------------------------------
+
+    topic_available = (
+        df["topic_size_baseline_views"].notna()
+        & (df["topic_size_baseline_views"] > 0)
+    )
 
     topic_fallback = (
         ~channel_available
@@ -229,6 +396,15 @@ def select_best_baseline(df):
         topic_fallback,
         "baseline_type"
     ] = "Topic + Channel Size"
+
+    # --------------------------------------------------------
+    # 3. CATEGORY + CHANNEL SIZE
+    # --------------------------------------------------------
+
+    category_available = (
+        df["category_size_baseline_views"].notna()
+        & (df["category_size_baseline_views"] > 0)
+    )
 
     category_fallback = (
         ~channel_available
@@ -249,22 +425,45 @@ def select_best_baseline(df):
         "baseline_type"
     ] = "Category + Channel Size"
 
+    # --------------------------------------------------------
+    # 4. CHANNEL SIZE
+    # --------------------------------------------------------
+
+    size_available = (
+        df["size_baseline_views"].notna()
+        & (df["size_baseline_views"] > 0)
+    )
+
+    size_fallback = (
+        ~channel_available
+        & ~topic_fallback
+        & ~category_fallback
+        & size_available
+    )
+
+    df.loc[
+        size_fallback,
+        "baseline_views"
+    ] = df.loc[
+        size_fallback,
+        "size_baseline_views"
+    ]
+
+    df.loc[
+        size_fallback,
+        "baseline_type"
+    ] = "Channel Size"
+
     return df
 
 
+# ============================================================
+# CREATE TARGET
+# ============================================================
+
 def create_relative_target(df):
-    """
-    Create the continuous relative-performance target.
 
-    Positive values:
-        Better than baseline
-
-    Around zero:
-        Around baseline
-
-    Negative values:
-        Worse than baseline
-    """
+    df = df.copy()
 
     valid = (
         df["view_count"].notna()
@@ -275,80 +474,184 @@ def create_relative_target(df):
 
     df["relative_performance"] = np.nan
 
-    df.loc[valid, "relative_performance"] = (
-        np.log1p(df.loc[valid, "view_count"])
+    df.loc[
+        valid,
+        "relative_performance"
+    ] = (
+        np.log1p(
+            df.loc[
+                valid,
+                "view_count"
+            ]
+        )
         -
-        np.log1p(df.loc[valid, "baseline_views"])
+        np.log1p(
+            df.loc[
+                valid,
+                "baseline_views"
+            ]
+        )
     )
 
     return df
 
 
-def print_baseline_statistics(df):
+# ============================================================
+# BUILD FINAL TARGET DATASET
+# ============================================================
+
+def build_target_dataset(
+    raw_df,
+    feature_df
+):
+
+    # Only bring the outcome into the feature dataset.
+    target_info = raw_df[
+        [
+            "video_id",
+            "view_count"
+        ]
+    ].copy()
+
+    final_df = feature_df.merge(
+        target_info,
+        on="video_id",
+        how="left"
+    )
+
+    # Add baseline and target information.
+    target_columns = [
+        "video_id",
+        "baseline_views",
+        "baseline_type",
+        "relative_performance"
+    ]
+
+    final_df = final_df.merge(
+        raw_df[target_columns],
+        on="video_id",
+        how="left"
+    )
+
+    return final_df
+
+
+# ============================================================
+# PRINT STATISTICS
+# ============================================================
+
+def print_statistics(df):
+
     print("\n" + "=" * 70)
     print("BASELINE COVERAGE")
     print("=" * 70)
 
     total = len(df)
 
-    channel_count = (
-        df["baseline_type"] == "Channel"
-    ).sum()
+    counts = (
+        df["baseline_type"]
+        .value_counts()
+    )
 
-    topic_count = (
-        df["baseline_type"] == "Topic + Channel Size"
-    ).sum()
+    for baseline_type in [
+        "Channel",
+        "Topic + Channel Size",
+        "Category + Channel Size",
+        "Channel Size",
+        "Unavailable"
+    ]:
 
-    category_count = (
-        df["baseline_type"] == "Category + Channel Size"
-    ).sum()
+        count = counts.get(
+            baseline_type,
+            0
+        )
 
-    unavailable_count = (
-        df["baseline_type"] == "Unavailable"
-    ).sum()
+        percentage = (
+            count / total * 100
+        )
 
-    print(f"\nTotal videos              : {total:,}")
-    print(f"Channel baseline          : {channel_count:,}")
-    print(f"Topic + channel size      : {topic_count:,}")
-    print(f"Category + channel size   : {category_count:,}")
-    print(f"Unavailable                : {unavailable_count:,}")
+        print(
+            f"{baseline_type:28s}: "
+            f"{count:,} "
+            f"({percentage:.2f}%)"
+        )
 
-    usable = total - unavailable_count
+    usable = (
+        df["relative_performance"]
+        .notna()
+        .sum()
+    )
 
     print(
         f"\nUsable target rows        : "
-        f"{usable:,} ({usable / total * 100:.2f}%)"
+        f"{usable:,} "
+        f"({usable / total * 100:.2f}%)"
     )
 
-
-def print_target_statistics(df):
     print("\n" + "=" * 70)
     print("RELATIVE PERFORMANCE TARGET")
     print("=" * 70)
 
-    target = df["relative_performance"].dropna()
+    target = (
+        df["relative_performance"]
+        .dropna()
+    )
 
-    print(f"\nValid target rows : {len(target):,}")
+    print(
+        f"\nValid target rows : "
+        f"{len(target):,}"
+    )
 
     if len(target) == 0:
-        print("No valid target values were created.")
         return
 
-    print(f"Mean              : {target.mean():.4f}")
-    print(f"Median            : {target.median():.4f}")
-    print(f"Std deviation     : {target.std():.4f}")
-    print(f"Minimum           : {target.min():.4f}")
-    print(f"Maximum           : {target.max():.4f}")
+    print(
+        f"Mean              : "
+        f"{target.mean():.4f}"
+    )
+
+    print(
+        f"Median            : "
+        f"{target.median():.4f}"
+    )
+
+    print(
+        f"Std deviation     : "
+        f"{target.std():.4f}"
+    )
+
+    print(
+        f"Minimum           : "
+        f"{target.min():.4f}"
+    )
+
+    print(
+        f"Maximum           : "
+        f"{target.max():.4f}"
+    )
 
     print("\nTarget percentiles:")
-    print(f"10th percentile   : {target.quantile(0.10):.4f}")
-    print(f"25th percentile   : {target.quantile(0.25):.4f}")
-    print(f"50th percentile   : {target.quantile(0.50):.4f}")
-    print(f"75th percentile   : {target.quantile(0.75):.4f}")
-    print(f"90th percentile   : {target.quantile(0.90):.4f}")
 
+    for percentile in [
+        0.10,
+        0.25,
+        0.50,
+        0.75,
+        0.90
+    ]:
+
+        print(
+            f"{int(percentile * 100):>2}th percentile   : "
+            f"{target.quantile(percentile):.4f}"
+        )
+
+
+# ============================================================
+# EXAMPLES
+# ============================================================
 
 def print_examples(df):
+
     print("\n" + "=" * 70)
     print("EXAMPLE TARGET CALCULATIONS")
     print("=" * 70)
@@ -357,16 +660,27 @@ def print_examples(df):
         "title",
         "channel_id",
         "subscriber_count",
+        "published_at",
         "view_count",
         "baseline_views",
         "baseline_type",
         "relative_performance"
     ]
 
-    examples = (
-        df[
-            df["relative_performance"].notna()
-        ][columns]
+    valid_df = df[
+        df["relative_performance"].notna()
+    ]
+
+    if valid_df.empty:
+        print("No valid target examples available.")
+        return
+
+    print("\nTop relative performers:")
+
+    top = (
+        valid_df[
+            columns
+        ]
         .sort_values(
             "relative_performance",
             ascending=False
@@ -374,19 +688,18 @@ def print_examples(df):
         .head(5)
     )
 
-    print("\nTop performing relative examples:")
     print(
-        examples.to_string(
+        top.to_string(
             index=False
         )
     )
 
-    print("\nLowest performing relative examples:")
+    print("\nLowest relative performers:")
 
-    examples_low = (
-        df[
-            df["relative_performance"].notna()
-        ][columns]
+    bottom = (
+        valid_df[
+            columns
+        ]
         .sort_values(
             "relative_performance",
             ascending=True
@@ -395,13 +708,18 @@ def print_examples(df):
     )
 
     print(
-        examples_low.to_string(
+        bottom.to_string(
             index=False
         )
     )
 
 
-def save_target_dataset(df):
+# ============================================================
+# SAVE
+# ============================================================
+
+def save_dataset(df):
+
     os.makedirs(
         TARGET_DATA_DIR,
         exist_ok=True
@@ -415,26 +733,89 @@ def save_target_dataset(df):
     print("\n" + "=" * 70)
     print("TARGET DATASET SAVED")
     print("=" * 70)
-    print(TARGET_DATA_PATH)
 
+    print(
+        f"Path    : {TARGET_DATA_PATH}"
+    )
+
+    print(
+        f"Rows    : {len(df):,}"
+    )
+
+    print(
+        f"Columns : {df.shape[1]:,}"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    df = load_data()
 
-    df = prepare_data(df)
-    df = create_channel_size_group(df)
-    df = create_topic_group(df)
-    df = calculate_channel_baseline(df)
-    df = calculate_topic_baseline(df)
-    df = calculate_category_baseline(df)
-    df = select_best_baseline(df)
-    df = create_relative_target(df)
+    # 1. Load processed data and model features
+    raw_df, feature_df = load_data()
 
-    print_baseline_statistics(df)
-    print_target_statistics(df)
-    print_examples(df)
+    # 2. Prepare raw data
+    raw_df = prepare_raw_data(
+        raw_df
+    )
 
-    save_target_dataset(df)
+    # 3. Create grouping information
+    raw_df = create_channel_size_group(
+        raw_df
+    )
+
+    raw_df = create_topic_group(
+        raw_df
+    )
+
+    # 4. Calculate TIME-AWARE baselines
+    raw_df = calculate_channel_baseline(
+        raw_df
+    )
+
+    raw_df = calculate_topic_baseline(
+        raw_df
+    )
+
+    raw_df = calculate_category_baseline(
+        raw_df
+    )
+
+    raw_df = calculate_size_baseline(
+        raw_df
+    )
+
+    # 5. Select best baseline
+    raw_df = select_best_baseline(
+        raw_df
+    )
+
+    # 6. Create target
+    raw_df = create_relative_target(
+        raw_df
+    )
+
+    # 7. Merge target with model features
+    final_df = build_target_dataset(
+        raw_df,
+        feature_df
+    )
+
+    # 8. Print statistics
+    print_statistics(
+        raw_df
+    )
+
+    print_examples(
+        raw_df
+    )
+
+    # 9. Save
+    save_dataset(
+        final_df
+    )
 
     print("\n" + "=" * 70)
     print("TARGET ENGINEERING COMPLETED")
