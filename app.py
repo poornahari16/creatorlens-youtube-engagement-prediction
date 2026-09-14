@@ -610,4 +610,4 @@ if predict_button:
 
         st.error(
             f"Prediction failed: {error}"
-        )
+        )   
